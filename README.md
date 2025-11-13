@@ -107,6 +107,18 @@ pytest -m "not cuda"
 pytest tests/test_gemm.py
 ```
 
+### Running Examples
+
+```bash
+# Run the GEMM example
+python examples/gemm_example.py
+```
+
+The example demonstrates:
+- Basic usage of both PyTorch and Triton implementations
+- Matrix multiplication with different sizes
+- Testing different block size configurations (when CUDA is available)
+
 ### Project Structure
 
 ```
@@ -119,6 +131,8 @@ triton_kernels/
 ├── tests/                   # Unit tests
 │   ├── __init__.py
 │   └── test_gemm.py        # GEMM tests
+├── examples/                # Example scripts
+│   └── gemm_example.py     # GEMM usage example
 ├── pyproject.toml          # Project configuration
 ├── setup.py                # Setup script
 └── README.md               # This file
