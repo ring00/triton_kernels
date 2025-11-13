@@ -64,3 +64,17 @@ line-ending = "auto"
 
 [tool.ruff.lint.isort]
 known-first-party = ["triton_kernels"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "cuda: marks tests that require CUDA (deselect with '-m \"not cuda\"')",
+]
