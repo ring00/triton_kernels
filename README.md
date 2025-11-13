@@ -119,6 +119,21 @@ The example demonstrates:
 - Matrix multiplication with different sizes
 - Testing different block size configurations (when CUDA is available)
 
+### Running Benchmarks
+
+```bash
+# Run the GEMM benchmark (requires CUDA)
+python benchmark/bench_gemm.py
+```
+
+The benchmark:
+- Compares performance of Triton vs PyTorch implementations
+- Tests different block size configurations
+- Generates performance plots showing TFLOPS across matrix sizes
+- Requires a CUDA-capable GPU
+
+See [benchmark/README.md](benchmark/README.md) for detailed information.
+
 ### Project Structure
 
 ```
@@ -133,6 +148,10 @@ triton_kernels/
 │   └── test_gemm.py        # GEMM tests
 ├── examples/                # Example scripts
 │   └── gemm_example.py     # GEMM usage example
+├── benchmark/               # Performance benchmarks
+│   ├── __init__.py
+│   ├── bench_gemm.py       # GEMM benchmark
+│   └── README.md           # Benchmark documentation
 ├── pyproject.toml          # Project configuration
 ├── setup.py                # Setup script
 └── README.md               # This file
