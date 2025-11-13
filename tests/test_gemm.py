@@ -5,7 +5,7 @@ Comprehensive unit tests for GEMM kernel implementations.
 import pytest
 import torch
 
-from triton_kernels.kernels.gemm import gemm_torch, gemm_triton
+from triton_kernels.gemm import gemm_torch, gemm_triton
 
 
 class TestGEMMTorch:
@@ -169,7 +169,12 @@ class TestGEMMTriton:
 
         c = gemm_triton(a, b)
 
-        assert torch.allclose(c, torch.zeros(M, N, device="cuda"), rtol=1e-2, atol=1e-2)
+        assert torch.allclose(
+            c,
+            torch.zeros(M, N, dtype=torch.float16, device="cuda"),
+            rtol=1e-2,
+            atol=1e-2,
+        )
 
     def test_incompatible_dimensions(self):
         """Test that incompatible dimensions raise an error."""

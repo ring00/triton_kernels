@@ -8,7 +8,7 @@ using triton.testing utilities.
 import torch
 import triton
 
-from triton_kernels.kernels.gemm import gemm_triton
+from triton_kernels.gemm import gemm_triton
 
 
 @triton.testing.perf_report(
