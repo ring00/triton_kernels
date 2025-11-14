@@ -3,16 +3,20 @@ Packed merge and split operations.
 
 This module provides:
 1. Reference PyTorch implementations for correctness validation
-2. Optimized Triton kernel implementations
+2. Optimized Triton kernel implementations with autograd support
 
 These operations are useful for merging and splitting packed sequences,
 commonly used in multi-modal models where different modalities (e.g., video and text)
 need to be processed together or separately.
 """
 
+from collections.abc import Sequence
+from typing import cast
+
 import torch
 import triton
 import triton.language as tl
+from torch.autograd.function import FunctionCtx
 
 
 def packed_merge_torch(
@@ -119,128 +123,366 @@ def packed_split_torch(
 
 @triton.jit
 def _packed_merge_kernel(
-    # Input pointers
+    output_ptr,
     vid_ptr,
     txt_ptr,
-    out_ptr,
-    # Offset arrays
-    vid_offsets_ptr,
-    txt_offsets_ptr,
-    out_offsets_ptr,
-    # Lengths arrays
     vid_lengths_ptr,
     txt_lengths_ptr,
-    # Dimensions
-    n_segments: tl.constexpr,
-    h: tl.constexpr,
-    has_txt: tl.constexpr,
-    # Block size
-    BLOCK_SIZE_H: tl.constexpr,
+    n_segments,
+    hidden_dim,
+    HAS_TXT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     """
     Triton kernel for packed merge operation.
 
-    Each program processes one segment at a time, copying data from
-    the appropriate input tensor to the output tensor.
+    Each program processes one output row, iterating through segments
+    to find which input row to copy from.
     """
-    pid = tl.program_id(axis=0)
+    row_idx = tl.program_id(0)
 
-    # Determine which segment this program is processing
-    segment_idx = pid // 2 if has_txt else pid
-    is_txt_segment = (pid % 2 == 1) if has_txt else False
+    vid_seg_offset = 0
+    txt_seg_offset = 0
+    out_seg_offset = 0
 
-    if segment_idx >= n_segments:
-        return
+    final_src_ptr = vid_ptr
+    final_src_idx = 0
+    found = False
 
-    # Load the length for this segment
-    if is_txt_segment:
-        length = tl.load(txt_lengths_ptr + segment_idx)
-        in_offset = tl.load(txt_offsets_ptr + segment_idx)
-        in_ptr = txt_ptr
-    else:
-        length = tl.load(vid_lengths_ptr + segment_idx)
-        in_offset = tl.load(vid_offsets_ptr + segment_idx)
-        in_ptr = vid_ptr
+    for i in range(n_segments):
+        vid_len = tl.load(vid_lengths_ptr + i)
+        if not found and row_idx < out_seg_offset + vid_len:
+            in_seg_idx = row_idx - out_seg_offset
+            final_src_idx = vid_seg_offset + in_seg_idx
+            final_src_ptr = vid_ptr
+            found = True
 
-    if length <= 0:
-        return
+        out_seg_offset += vid_len
+        vid_seg_offset += vid_len
 
-    out_offset = tl.load(out_offsets_ptr + pid)
+        if HAS_TXT:
+            txt_len = tl.load(txt_lengths_ptr + i)
+            if not found and row_idx < out_seg_offset + txt_len:
+                in_seg_idx = row_idx - out_seg_offset
+                final_src_idx = txt_seg_offset + in_seg_idx
+                final_src_ptr = txt_ptr
+                found = True
 
-    # Process each row
-    for row in range(length):
-        # Load from input
-        h_offsets = tl.arange(0, BLOCK_SIZE_H)
-        mask = h_offsets < h
+            out_seg_offset += txt_len
+            txt_seg_offset += txt_len
 
-        in_addr = in_ptr + (in_offset + row) * h + h_offsets
-        out_addr = out_ptr + (out_offset + row) * h + h_offsets
+    src_ptr = final_src_ptr + final_src_idx * hidden_dim
+    dst_ptr = output_ptr + row_idx * hidden_dim
 
-        data = tl.load(in_addr, mask=mask, other=0.0)
-        tl.store(out_addr, data, mask=mask)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < hidden_dim
+
+    vals = tl.load(src_ptr + cols, mask=mask)
+    tl.store(dst_ptr + cols, vals, mask=mask)
 
 
 @triton.jit
 def _packed_split_kernel(
-    # Input/Output pointers
-    x_ptr,
-    vid_ptr,
-    txt_ptr,
-    # Offset arrays
-    x_offsets_ptr,
-    vid_offsets_ptr,
-    txt_offsets_ptr,
-    # Lengths arrays
+    input_ptr,
+    vid_out_ptr,
+    txt_out_ptr,
     vid_lengths_ptr,
     txt_lengths_ptr,
-    # Dimensions
-    n_segments: tl.constexpr,
-    h: tl.constexpr,
-    has_txt: tl.constexpr,
-    # Block size
-    BLOCK_SIZE_H: tl.constexpr,
+    n_segments,
+    hidden_dim,
+    HAS_TXT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     """
     Triton kernel for packed split operation.
 
-    Each program processes one segment at a time, copying data from
-    the input tensor to the appropriate output tensor.
+    Each program processes one input row, iterating through segments
+    to find which output position to write to.
     """
-    pid = tl.program_id(axis=0)
+    row_idx = tl.program_id(0)
 
-    # Determine which segment this program is processing
-    segment_idx = pid // 2 if has_txt else pid
-    is_txt_segment = (pid % 2 == 1) if has_txt else False
+    vid_seg_offset = 0
+    txt_seg_offset = 0
+    in_seg_offset = 0
 
-    if segment_idx >= n_segments:
-        return
+    final_dst_ptr = vid_out_ptr
+    final_dst_idx = 0
+    found = False
 
-    # Load the length for this segment
-    if is_txt_segment:
-        length = tl.load(txt_lengths_ptr + segment_idx)
-        out_offset = tl.load(txt_offsets_ptr + segment_idx)
-        out_ptr = txt_ptr
-    else:
-        length = tl.load(vid_lengths_ptr + segment_idx)
-        out_offset = tl.load(vid_offsets_ptr + segment_idx)
-        out_ptr = vid_ptr
+    for i in range(n_segments):
+        vid_len = tl.load(vid_lengths_ptr + i)
+        if not found and row_idx < in_seg_offset + vid_len:
+            in_seg_idx = row_idx - in_seg_offset
+            final_dst_idx = vid_seg_offset + in_seg_idx
+            final_dst_ptr = vid_out_ptr
+            found = True
 
-    if length <= 0:
-        return
+        in_seg_offset += vid_len
+        vid_seg_offset += vid_len
 
-    x_offset = tl.load(x_offsets_ptr + pid)
+        if HAS_TXT:
+            txt_len = tl.load(txt_lengths_ptr + i)
+            if not found and row_idx < in_seg_offset + txt_len:
+                in_seg_idx = row_idx - in_seg_offset
+                final_dst_idx = txt_seg_offset + in_seg_idx
+                final_dst_ptr = txt_out_ptr
+                found = True
 
-    # Process each row
-    for row in range(length):
-        # Load from input
-        h_offsets = tl.arange(0, BLOCK_SIZE_H)
-        mask = h_offsets < h
+            in_seg_offset += txt_len
+            txt_seg_offset += txt_len
 
-        x_addr = x_ptr + (x_offset + row) * h + h_offsets
-        out_addr = out_ptr + (out_offset + row) * h + h_offsets
+    src_ptr = input_ptr + row_idx * hidden_dim
+    dst_ptr = final_dst_ptr + final_dst_idx * hidden_dim
 
-        data = tl.load(x_addr, mask=mask, other=0.0)
-        tl.store(out_addr, data, mask=mask)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < hidden_dim
+
+    vals = tl.load(src_ptr + cols, mask=mask)
+    tl.store(dst_ptr + cols, vals, mask=mask)
+
+
+class _PackedMerge(torch.autograd.Function):
+    """Autograd function for packed merge with Triton kernel."""
+
+    @staticmethod
+    def forward(
+        ctx: FunctionCtx,
+        vid: torch.Tensor,
+        txt: torch.Tensor | None,
+        vid_lengths: Sequence[int],
+        txt_lengths: Sequence[int] | None,
+    ) -> torch.Tensor:
+        vid_shape = vid.shape
+        vid_trailing_shape = vid_shape[1:]
+        vid_flat = vid.view(vid_shape[0], -1)
+        hidden_dim = vid_flat.shape[1]
+
+        vid_lengths_t = torch.tensor(vid_lengths, device=vid.device, dtype=torch.int32)
+
+        has_txt = txt is not None and txt_lengths is not None
+        if has_txt:
+            txt_shape = txt.shape
+            assert txt_shape[1:] == vid_trailing_shape, (
+                "Trailing dimensions of vid and txt must match."
+            )
+            txt_flat = txt.view(txt_shape[0], -1)
+            txt_lengths_t = torch.tensor(
+                txt_lengths, device=vid.device, dtype=torch.int32
+            )
+            out_len = vid_lengths_t.sum() + txt_lengths_t.sum()
+        else:
+            txt_shape = None
+            txt_flat = vid_flat  # Dummy tensor
+            txt_lengths_t = torch.empty(0, device=vid.device, dtype=torch.int32)
+            out_len = vid_lengths_t.sum()
+
+        output_flat = torch.empty(
+            out_len, hidden_dim, device=vid.device, dtype=vid.dtype
+        )
+
+        ctx.save_for_backward(vid_lengths_t, txt_lengths_t)
+        ctx.vid_shape = vid_shape
+        ctx.txt_shape = txt_shape
+
+        if out_len == 0:
+            return output_flat.view(out_len, *vid_trailing_shape)
+
+        grid = (out_len,)
+
+        _packed_merge_kernel[grid](
+            output_flat,
+            vid_flat,
+            txt_flat,
+            vid_lengths_t,
+            txt_lengths_t,
+            n_segments=len(vid_lengths),
+            hidden_dim=hidden_dim,
+            HAS_TXT=has_txt,
+            BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
+        )
+
+        output = output_flat.view(out_len, *vid_trailing_shape)
+        return output
+
+    @staticmethod
+    def backward(
+        ctx: FunctionCtx, grad_output: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, None, None]:
+        grad_output_flat = grad_output.view(grad_output.shape[0], -1)
+        hidden_dim = grad_output_flat.shape[1]
+
+        vid_lengths_t, txt_lengths_t = ctx.saved_tensors
+
+        has_txt = ctx.txt_shape is not None
+
+        grad_vid_flat = torch.zeros(
+            ctx.vid_shape[0],
+            hidden_dim,
+            device=grad_output.device,
+            dtype=grad_output.dtype,
+        )
+        grad_txt_flat = (
+            torch.zeros(
+                ctx.txt_shape[0],
+                hidden_dim,
+                device=grad_output.device,
+                dtype=grad_output.dtype,
+            )
+            if has_txt
+            else None
+        )
+
+        if grad_output.shape[0] == 0:
+            grad_vid = grad_vid_flat.view(ctx.vid_shape)
+            grad_txt = None
+            if has_txt:
+                assert ctx.txt_shape is not None and grad_txt_flat is not None
+                grad_txt = grad_txt_flat.view(ctx.txt_shape)
+            return grad_vid, grad_txt, None, None
+
+        grid = (grad_output.shape[0],)
+
+        grad_txt_kernel_arg = (
+            cast(torch.Tensor, grad_txt_flat) if has_txt else grad_vid_flat
+        )
+
+        _packed_split_kernel[grid](
+            grad_output_flat,
+            grad_vid_flat,
+            grad_txt_kernel_arg,
+            vid_lengths_t,
+            txt_lengths_t,
+            n_segments=vid_lengths_t.shape[0],
+            hidden_dim=hidden_dim,
+            HAS_TXT=has_txt,
+            BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
+        )
+
+        grad_vid = grad_vid_flat.view(ctx.vid_shape)
+        if has_txt:
+            assert ctx.txt_shape is not None and grad_txt_flat is not None
+            grad_txt = grad_txt_flat.view(ctx.txt_shape)
+        else:
+            grad_txt = None
+
+        return grad_vid, grad_txt, None, None
+
+
+class _PackedSplit(torch.autograd.Function):
+    """Autograd function for packed split with Triton kernel."""
+
+    @staticmethod
+    def forward(
+        ctx: FunctionCtx,
+        x: torch.Tensor,
+        vid_lengths: Sequence[int],
+        txt_lengths: Sequence[int] | None,
+        vid_padding: int,
+        txt_padding: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        x_shape = x.shape
+        x_trailing_shape = x_shape[1:]
+        x_flat = x.view(x_shape[0], -1)
+        hidden_dim = x_flat.shape[1]
+
+        vid_lengths_t = torch.tensor(vid_lengths, device=x.device, dtype=torch.int32)
+        has_txt = txt_lengths is not None
+
+        vid_sum_len = vid_lengths_t.sum()
+        vid_shape_flat = (vid_sum_len + vid_padding, hidden_dim)
+        vid_out_flat = torch.zeros(vid_shape_flat, device=x.device, dtype=x.dtype)
+
+        if has_txt:
+            txt_lengths_t = torch.tensor(
+                txt_lengths, device=x.device, dtype=torch.int32
+            )
+            txt_sum_len = txt_lengths_t.sum()
+            txt_shape_flat = (txt_sum_len + txt_padding, hidden_dim)
+            txt_out_flat = torch.zeros(txt_shape_flat, device=x.device, dtype=x.dtype)
+        else:
+            txt_lengths_t = torch.empty(0, device=x.device, dtype=torch.int32)
+            txt_out_flat = None
+
+        ctx.save_for_backward(vid_lengths_t, txt_lengths_t)
+        ctx.x_shape = x_shape
+        ctx.vid_padding = vid_padding
+        ctx.txt_padding = txt_padding
+
+        if x.shape[0] == 0:
+            vid_out = vid_out_flat.view(vid_shape_flat[0], *x_trailing_shape)
+            if has_txt:
+                assert txt_out_flat is not None
+                txt_out = txt_out_flat.view(txt_shape_flat[0], *x_trailing_shape)
+            else:
+                txt_out = None
+            return vid_out, txt_out
+
+        grid = (x.shape[0],)
+
+        txt_out_kernel_arg = txt_out_flat if has_txt else vid_out_flat  # Dummy
+
+        _packed_split_kernel[grid](
+            x_flat,
+            vid_out_flat,
+            txt_out_kernel_arg,
+            vid_lengths_t,
+            txt_lengths_t,
+            n_segments=vid_lengths_t.shape[0],
+            hidden_dim=hidden_dim,
+            HAS_TXT=has_txt,
+            BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
+        )
+
+        vid_out = vid_out_flat.view(vid_shape_flat[0], *x_trailing_shape)
+        if has_txt:
+            assert txt_out_flat is not None
+            txt_out = txt_out_flat.view(txt_shape_flat[0], *x_trailing_shape)
+        else:
+            txt_out = None
+
+        return vid_out, txt_out
+
+    @staticmethod
+    def backward(
+        ctx: FunctionCtx, grad_vid: torch.Tensor, grad_txt: torch.Tensor | None
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        grad_vid_flat = grad_vid.view(grad_vid.shape[0], -1)
+        hidden_dim = grad_vid_flat.shape[1]
+
+        vid_lengths_t, txt_lengths_t = ctx.saved_tensors
+
+        has_txt = grad_txt is not None
+        if has_txt:
+            grad_txt_flat = grad_txt.view(grad_txt.shape[0], -1)
+        else:
+            grad_txt_flat = None
+
+        grad_x_flat = torch.zeros(
+            ctx.x_shape[0], hidden_dim, device=grad_vid.device, dtype=grad_vid.dtype
+        )
+
+        if grad_x_flat.shape[0] == 0:
+            return grad_x_flat.view(ctx.x_shape), None, None, None, None
+
+        grid = (grad_x_flat.shape[0],)
+        grad_txt_kernel_arg = (
+            cast(torch.Tensor, grad_txt_flat) if has_txt else grad_vid_flat
+        )
+
+        _packed_merge_kernel[grid](
+            grad_x_flat,
+            grad_vid_flat,
+            grad_txt_kernel_arg,
+            vid_lengths_t,
+            txt_lengths_t,
+            n_segments=vid_lengths_t.shape[0],
+            hidden_dim=hidden_dim,
+            HAS_TXT=has_txt,
+            BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
+        )
+
+        grad_x = grad_x_flat.view(ctx.x_shape)
+        return grad_x, None, None, None, None
 
 
 def packed_merge_triton(
@@ -248,126 +490,25 @@ def packed_merge_triton(
     txt: torch.Tensor | None,
     vid_lengths: list[int],
     txt_lengths: list[int] | None,
-    block_size_h: int = 128,
 ) -> torch.Tensor:
     """
-    Triton implementation of packed merge operation.
+    Triton implementation of packed merge operation with autograd support.
 
     Merges two tensors based on the provided lengths, interleaving segments
-    from both tensors according to the length lists.
+    from both tensors according to the length lists. This implementation
+    supports automatic differentiation.
 
     Args:
-        vid: Query tensor for the first segment of shape (s, h) on CUDA.
-        txt: Query tensor for the second segment of shape (s', h) on CUDA or None.
+        vid: Video tensor of shape (total_vid_length, ...) on CUDA.
+        txt: Text tensor of shape (total_txt_length, ...) on CUDA or None.
         vid_lengths: List of lengths for the video segments.
         txt_lengths: List of lengths for the text segments or None.
-        block_size_h: Block size for the hidden dimension (default: 128).
 
     Returns:
-        Merged tensor of shape (total_length, h) where total_length is the
+        Merged tensor of shape (total_length, ...) where total_length is the
         sum of all segment lengths.
     """
-    assert vid.is_cuda, "Input tensor must be on CUDA"
-    assert vid.is_contiguous(), "Input tensor must be contiguous"
-    if txt is not None:
-        assert txt.is_cuda, "Text tensor must be on CUDA"
-        assert txt.is_contiguous(), "Text tensor must be contiguous"
-        assert len(vid_lengths) == len(txt_lengths), "Length lists must match"
-
-    h = vid.shape[1]
-    device = vid.device
-    dtype = vid.dtype
-
-    # Calculate total output length and build offset arrays
-    has_txt = txt is not None and txt_lengths is not None
-    segments_info = []
-    vid_offset = 0
-    txt_offset = 0
-    out_offset = 0
-
-    if has_txt:
-        for vid_len, txt_len in zip(vid_lengths, txt_lengths, strict=True):
-            if vid_len > 0:
-                segments_info.append(
-                    ("vid", vid_len, vid_offset, out_offset)
-                )  # type, length, in_offset, out_offset
-                vid_offset += vid_len
-                out_offset += vid_len
-            if txt_len > 0:
-                segments_info.append(("txt", txt_len, txt_offset, out_offset))
-                txt_offset += txt_len
-                out_offset += txt_len
-    else:
-        for vid_len in vid_lengths:
-            if vid_len > 0:
-                segments_info.append(("vid", vid_len, vid_offset, out_offset))
-                vid_offset += vid_len
-                out_offset += vid_len
-
-    total_length = out_offset
-
-    # Create output tensor
-    output = torch.empty((total_length, h), device=device, dtype=dtype)
-
-    if total_length == 0:
-        return output
-
-    # Build offset arrays for kernel
-    n_programs = len(segments_info)
-    out_offsets = torch.zeros(n_programs, dtype=torch.int32, device=device)
-    vid_offsets_list = []
-    txt_offsets_list = []
-    vid_lengths_list = []
-    txt_lengths_list = []
-
-    program_idx = 0
-    for seg_type, length, in_offset, out_off in segments_info:
-        out_offsets[program_idx] = out_off
-        if seg_type == "vid":
-            vid_offsets_list.append(in_offset)
-            vid_lengths_list.append(length)
-            if has_txt:
-                txt_offsets_list.append(0)
-                txt_lengths_list.append(0)
-        else:  # txt
-            txt_offsets_list.append(in_offset)
-            txt_lengths_list.append(length)
-            vid_offsets_list.append(0)
-            vid_lengths_list.append(0)
-        program_idx += 1
-
-    vid_offsets = torch.tensor(vid_offsets_list, dtype=torch.int32, device=device)
-    vid_lengths_t = torch.tensor(vid_lengths_list, dtype=torch.int32, device=device)
-
-    if has_txt:
-        txt_offsets = torch.tensor(txt_offsets_list, dtype=torch.int32, device=device)
-        txt_lengths_t = torch.tensor(txt_lengths_list, dtype=torch.int32, device=device)
-    else:
-        # Create dummy tensors for the case without text
-        txt_offsets = torch.zeros(1, dtype=torch.int32, device=device)
-        txt_lengths_t = torch.zeros(1, dtype=torch.int32, device=device)
-        txt = torch.empty((0, h), device=device, dtype=dtype)
-
-    # Launch kernel
-    n_segments = len(vid_lengths)
-    grid = (n_programs,)
-
-    _packed_merge_kernel[grid](
-        vid,
-        txt,
-        output,
-        vid_offsets,
-        txt_offsets,
-        out_offsets,
-        vid_lengths_t,
-        txt_lengths_t,
-        n_segments=n_segments,
-        h=h,
-        has_txt=has_txt,
-        BLOCK_SIZE_H=triton.next_power_of_2(h),
-    )
-
-    return output
+    return _PackedMerge.apply(vid, txt, vid_lengths, txt_lengths)
 
 
 def packed_split_triton(
@@ -376,131 +517,23 @@ def packed_split_triton(
     txt_lengths: list[int] | None,
     vid_padding: int = 0,
     txt_padding: int = 0,
-    block_size_h: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
-    Triton implementation of packed split operation.
+    Triton implementation of packed split operation with autograd support.
 
     Splits the input tensor into two segments based on the provided lengths,
-    with optional padding for each segment.
+    with optional padding for each segment. This implementation supports
+    automatic differentiation.
 
     Args:
-        x: Input tensor of shape (s, h) on CUDA.
-        vid_lengths: List of lengths for the first segment.
-        txt_lengths: List of lengths for the second segment or None.
-        vid_padding: Padding size for the first segment.
-        txt_padding: Padding size for the second segment.
-        block_size_h: Block size for the hidden dimension (default: 128).
+        x: Input tensor of shape (total_length, ...) on CUDA.
+        vid_lengths: List of lengths for the video segments.
+        txt_lengths: List of lengths for the text segments or None.
+        vid_padding: Padding size for the video output (default: 0).
+        txt_padding: Padding size for the text output (default: 0).
 
     Returns:
         tuple[torch.Tensor, torch.Tensor | None]: Two tensors corresponding
         to the split segments. The second tensor is None if txt_lengths is None.
     """
-    assert x.is_cuda, "Input tensor must be on CUDA"
-    assert x.is_contiguous(), "Input tensor must be contiguous"
-    if txt_lengths is not None:
-        assert len(vid_lengths) == len(txt_lengths), "Length lists must match"
-
-    h = x.shape[1]
-    device = x.device
-    dtype = x.dtype
-
-    has_txt = txt_lengths is not None
-    segments_info = []
-    vid_offset_out = 0
-    txt_offset_out = 0
-    x_offset = 0
-
-    # Build segment information
-    if has_txt:
-        for vid_len, txt_len in zip(vid_lengths, txt_lengths, strict=True):
-            if vid_len > 0:
-                segments_info.append(
-                    ("vid", vid_len, x_offset, vid_offset_out)
-                )  # type, length, x_offset, out_offset
-                x_offset += vid_len
-                vid_offset_out += vid_len
-            if txt_len > 0:
-                segments_info.append(("txt", txt_len, x_offset, txt_offset_out))
-                x_offset += txt_len
-                txt_offset_out += txt_len
-    else:
-        for vid_len in vid_lengths:
-            if vid_len > 0:
-                segments_info.append(("vid", vid_len, x_offset, vid_offset_out))
-                x_offset += vid_len
-                vid_offset_out += vid_len
-
-    # Calculate output sizes
-    total_vid_length = vid_offset_out + vid_padding
-    total_txt_length = txt_offset_out + txt_padding if has_txt else 0
-
-    # Create output tensors
-    vid_out = torch.zeros((total_vid_length, h), device=device, dtype=dtype)
-    txt_out = (
-        torch.zeros((total_txt_length, h), device=device, dtype=dtype)
-        if has_txt
-        else None
-    )
-
-    if len(segments_info) == 0:
-        return vid_out, txt_out
-
-    # Build offset arrays for kernel
-    n_programs = len(segments_info)
-    x_offsets = torch.zeros(n_programs, dtype=torch.int32, device=device)
-    vid_offsets_list = []
-    txt_offsets_list = []
-    vid_lengths_list = []
-    txt_lengths_list = []
-
-    program_idx = 0
-    for seg_type, length, x_off, out_off in segments_info:
-        x_offsets[program_idx] = x_off
-        if seg_type == "vid":
-            vid_offsets_list.append(out_off)
-            vid_lengths_list.append(length)
-            if has_txt:
-                txt_offsets_list.append(0)
-                txt_lengths_list.append(0)
-        else:  # txt
-            txt_offsets_list.append(out_off)
-            txt_lengths_list.append(length)
-            vid_offsets_list.append(0)
-            vid_lengths_list.append(0)
-        program_idx += 1
-
-    vid_offsets = torch.tensor(vid_offsets_list, dtype=torch.int32, device=device)
-    vid_lengths_t = torch.tensor(vid_lengths_list, dtype=torch.int32, device=device)
-
-    if has_txt:
-        txt_offsets = torch.tensor(txt_offsets_list, dtype=torch.int32, device=device)
-        txt_lengths_t = torch.tensor(txt_lengths_list, dtype=torch.int32, device=device)
-        if txt_out is None:
-            txt_out = torch.empty((0, h), device=device, dtype=dtype)
-    else:
-        # Create dummy tensors for the case without text
-        txt_offsets = torch.zeros(1, dtype=torch.int32, device=device)
-        txt_lengths_t = torch.zeros(1, dtype=torch.int32, device=device)
-        txt_out = torch.empty((0, h), device=device, dtype=dtype)
-
-    # Launch kernel
-    n_segments = len(vid_lengths)
-    grid = (n_programs,)
-
-    _packed_split_kernel[grid](
-        x,
-        vid_out,
-        txt_out,
-        x_offsets,
-        vid_offsets,
-        txt_offsets,
-        vid_lengths_t,
-        txt_lengths_t,
-        n_segments=n_segments,
-        h=h,
-        has_txt=has_txt,
-        BLOCK_SIZE_H=triton.next_power_of_2(h),
-    )
-
-    return vid_out, txt_out if has_txt else None
+    return _PackedSplit.apply(x, vid_lengths, txt_lengths, vid_padding, txt_padding)
