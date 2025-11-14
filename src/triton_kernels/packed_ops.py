@@ -134,10 +134,15 @@ def _packed_merge_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Triton kernel for packed merge operation.
+    Triton kernel for packed merge operation optimized for H100.
 
     Each program processes one output row, iterating through segments
     to find which input row to copy from.
+
+    Optimizations:
+    - Vectorized memory loads with eviction policy hints
+    - Early exit on segment found
+    - Optimized for H100's 3 TB/s HBM3 bandwidth
     """
     row_idx = tl.program_id(0)
 
@@ -149,24 +154,30 @@ def _packed_merge_kernel(
     final_src_idx = 0
     found = False
 
+    # Optimized segment scanning with early exit
     for i in range(n_segments):
+        if found:
+            break
+
         vid_len = tl.load(vid_lengths_ptr + i)
-        if not found and row_idx < out_seg_offset + vid_len:
+        if row_idx < out_seg_offset + vid_len:
             in_seg_idx = row_idx - out_seg_offset
             final_src_idx = vid_seg_offset + in_seg_idx
             final_src_ptr = vid_ptr
             found = True
+            break
 
         out_seg_offset += vid_len
         vid_seg_offset += vid_len
 
         if HAS_TXT:
             txt_len = tl.load(txt_lengths_ptr + i)
-            if not found and row_idx < out_seg_offset + txt_len:
+            if row_idx < out_seg_offset + txt_len:
                 in_seg_idx = row_idx - out_seg_offset
                 final_src_idx = txt_seg_offset + in_seg_idx
                 final_src_ptr = txt_ptr
                 found = True
+                break
 
             out_seg_offset += txt_len
             txt_seg_offset += txt_len
@@ -174,10 +185,12 @@ def _packed_merge_kernel(
     src_ptr = final_src_ptr + final_src_idx * hidden_dim
     dst_ptr = output_ptr + row_idx * hidden_dim
 
+    # Vectorized memory operations with optimal block size for H100
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < hidden_dim
 
-    vals = tl.load(src_ptr + cols, mask=mask)
+    # Use eviction policy for better cache utilization on H100
+    vals = tl.load(src_ptr + cols, mask=mask, eviction_policy="evict_last")
     tl.store(dst_ptr + cols, vals, mask=mask)
 
 
@@ -194,10 +207,15 @@ def _packed_split_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Triton kernel for packed split operation.
+    Triton kernel for packed split operation optimized for H100.
 
     Each program processes one input row, iterating through segments
     to find which output position to write to.
+
+    Optimizations:
+    - Vectorized memory loads with eviction policy hints
+    - Early exit on segment found
+    - Optimized for H100's 3 TB/s HBM3 bandwidth
     """
     row_idx = tl.program_id(0)
 
@@ -209,24 +227,30 @@ def _packed_split_kernel(
     final_dst_idx = 0
     found = False
 
+    # Optimized segment scanning with early exit
     for i in range(n_segments):
+        if found:
+            break
+
         vid_len = tl.load(vid_lengths_ptr + i)
-        if not found and row_idx < in_seg_offset + vid_len:
+        if row_idx < in_seg_offset + vid_len:
             in_seg_idx = row_idx - in_seg_offset
             final_dst_idx = vid_seg_offset + in_seg_idx
             final_dst_ptr = vid_out_ptr
             found = True
+            break
 
         in_seg_offset += vid_len
         vid_seg_offset += vid_len
 
         if HAS_TXT:
             txt_len = tl.load(txt_lengths_ptr + i)
-            if not found and row_idx < in_seg_offset + txt_len:
+            if row_idx < in_seg_offset + txt_len:
                 in_seg_idx = row_idx - in_seg_offset
                 final_dst_idx = txt_seg_offset + in_seg_idx
                 final_dst_ptr = txt_out_ptr
                 found = True
+                break
 
             in_seg_offset += txt_len
             txt_seg_offset += txt_len
@@ -234,10 +258,12 @@ def _packed_split_kernel(
     src_ptr = input_ptr + row_idx * hidden_dim
     dst_ptr = final_dst_ptr + final_dst_idx * hidden_dim
 
+    # Vectorized memory operations with optimal block size for H100
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < hidden_dim
 
-    vals = tl.load(src_ptr + cols, mask=mask)
+    # Use eviction policy for better cache utilization on H100
+    vals = tl.load(src_ptr + cols, mask=mask, eviction_policy="evict_last")
     tl.store(dst_ptr + cols, vals, mask=mask)
 
 
@@ -289,6 +315,12 @@ class _PackedMerge(torch.autograd.Function):
 
         grid = (out_len,)
 
+        # Optimized block size selection for H100 GPU
+        # H100 has 228 KB shared memory per SM, so we can use larger blocks
+        # Use powers of 2 with minimum of 128 for better vectorization
+        block_size = triton.next_power_of_2(hidden_dim)
+        block_size = max(128, min(block_size, 2048))
+
         _packed_merge_kernel[grid](
             output_flat,
             vid_flat,
@@ -298,7 +330,7 @@ class _PackedMerge(torch.autograd.Function):
             n_segments=len(vid_lengths),
             hidden_dim=hidden_dim,
             HAS_TXT=has_txt,
-            BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
+            BLOCK_SIZE=block_size,
         )
 
         output = output_flat.view(out_len, *vid_trailing_shape)
@@ -346,6 +378,10 @@ class _PackedMerge(torch.autograd.Function):
             cast(torch.Tensor, grad_txt_flat) if has_txt else grad_vid_flat
         )
 
+        # Optimized block size selection for H100 GPU
+        block_size = triton.next_power_of_2(hidden_dim)
+        block_size = max(128, min(block_size, 2048))
+
         _packed_split_kernel[grid](
             grad_output_flat,
             grad_vid_flat,
@@ -355,7 +391,7 @@ class _PackedMerge(torch.autograd.Function):
             n_segments=vid_lengths_t.shape[0],
             hidden_dim=hidden_dim,
             HAS_TXT=has_txt,
-            BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
+            BLOCK_SIZE=block_size,
         )
 
         grad_vid = grad_vid_flat.view(ctx.vid_shape)
@@ -421,6 +457,10 @@ class _PackedSplit(torch.autograd.Function):
 
         txt_out_kernel_arg = txt_out_flat if has_txt else vid_out_flat  # Dummy
 
+        # Optimized block size selection for H100 GPU
+        block_size = triton.next_power_of_2(hidden_dim)
+        block_size = max(128, min(block_size, 2048))
+
         _packed_split_kernel[grid](
             x_flat,
             vid_out_flat,
@@ -430,7 +470,7 @@ class _PackedSplit(torch.autograd.Function):
             n_segments=vid_lengths_t.shape[0],
             hidden_dim=hidden_dim,
             HAS_TXT=has_txt,
-            BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
+            BLOCK_SIZE=block_size,
         )
 
         vid_out = vid_out_flat.view(vid_shape_flat[0], *x_trailing_shape)
@@ -469,6 +509,10 @@ class _PackedSplit(torch.autograd.Function):
             cast(torch.Tensor, grad_txt_flat) if has_txt else grad_vid_flat
         )
 
+        # Optimized block size selection for H100 GPU
+        block_size = triton.next_power_of_2(hidden_dim)
+        block_size = max(128, min(block_size, 2048))
+
         _packed_merge_kernel[grid](
             grad_x_flat,
             grad_vid_flat,
@@ -478,7 +522,7 @@ class _PackedSplit(torch.autograd.Function):
             n_segments=vid_lengths_t.shape[0],
             hidden_dim=hidden_dim,
             HAS_TXT=has_txt,
-            BLOCK_SIZE=triton.next_power_of_2(hidden_dim),
+            BLOCK_SIZE=block_size,
         )
 
         grad_x = grad_x_flat.view(ctx.x_shape)
