@@ -8,6 +8,13 @@ This module provides:
 These operations are useful for merging and splitting packed sequences,
 commonly used in multi-modal models where different modalities (e.g., video and text)
 need to be processed together or separately.
+
+Performance Note:
+The Triton kernels are optimized for NVIDIA H100 GPUs with:
+- Memory pipeline optimization (num_stages=4)
+- Cache eviction policies for 50 MB L2 cache
+- Block size optimization for 228 KB shared memory per SM
+- Early exit segment scanning for reduced latency
 """
 
 from collections.abc import Sequence
