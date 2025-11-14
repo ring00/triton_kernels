@@ -321,6 +321,8 @@ class _PackedMerge(torch.autograd.Function):
         block_size = triton.next_power_of_2(hidden_dim)
         block_size = max(128, min(block_size, 2048))
 
+        # Use num_stages for better pipeline utilization on H100
+        # H100's improved memory subsystem benefits from deeper pipelining
         _packed_merge_kernel[grid](
             output_flat,
             vid_flat,
@@ -331,6 +333,8 @@ class _PackedMerge(torch.autograd.Function):
             hidden_dim=hidden_dim,
             HAS_TXT=has_txt,
             BLOCK_SIZE=block_size,
+            num_stages=4,
+            num_warps=4,
         )
 
         output = output_flat.view(out_len, *vid_trailing_shape)
@@ -392,6 +396,8 @@ class _PackedMerge(torch.autograd.Function):
             hidden_dim=hidden_dim,
             HAS_TXT=has_txt,
             BLOCK_SIZE=block_size,
+            num_stages=4,
+            num_warps=4,
         )
 
         grad_vid = grad_vid_flat.view(ctx.vid_shape)
@@ -471,6 +477,8 @@ class _PackedSplit(torch.autograd.Function):
             hidden_dim=hidden_dim,
             HAS_TXT=has_txt,
             BLOCK_SIZE=block_size,
+            num_stages=4,
+            num_warps=4,
         )
 
         vid_out = vid_out_flat.view(vid_shape_flat[0], *x_trailing_shape)
@@ -523,6 +531,8 @@ class _PackedSplit(torch.autograd.Function):
             hidden_dim=hidden_dim,
             HAS_TXT=has_txt,
             BLOCK_SIZE=block_size,
+            num_stages=4,
+            num_warps=4,
         )
 
         grad_x = grad_x_flat.view(ctx.x_shape)
