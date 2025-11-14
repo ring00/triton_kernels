@@ -74,6 +74,53 @@ c_triton = gemm_triton(a_gpu, b_gpu)
 - `block_size_n`: Block size for N dimension (default: 128)
 - `block_size_k`: Block size for K dimension (default: 32)
 
+### Packed Operations (Merge and Split)
+
+Packed merge and split operations for handling variable-length sequences, commonly used in multi-modal models.
+
+**Usage:**
+
+```python
+import torch
+from triton_kernels import (
+    packed_merge_torch,
+    packed_merge_triton,
+    packed_split_torch,
+    packed_split_triton,
+)
+
+# Create input tensors
+vid = torch.randn(10, 64, dtype=torch.float32)
+txt = torch.randn(6, 64, dtype=torch.float32)
+vid_lengths = [4, 3, 3]
+txt_lengths = [2, 2, 2]
+
+# PyTorch reference implementations
+merged = packed_merge_torch(vid, txt, vid_lengths, txt_lengths)
+vid_split, txt_split = packed_split_torch(merged, vid_lengths, txt_lengths)
+
+# Triton optimized implementations (requires CUDA)
+vid_gpu = vid.to(device='cuda', dtype=torch.float16)
+txt_gpu = txt.to(device='cuda', dtype=torch.float16)
+merged_triton = packed_merge_triton(vid_gpu, txt_gpu, vid_lengths, txt_lengths)
+vid_triton, txt_triton = packed_split_triton(merged_triton, vid_lengths, txt_lengths)
+```
+
+**Parameters for packed_merge:**
+- `vid`: Video tensor of shape (total_vid_length, h)
+- `txt`: Text tensor of shape (total_txt_length, h) or None
+- `vid_lengths`: List of lengths for video segments
+- `txt_lengths`: List of lengths for text segments or None
+- `block_size_h`: Block size for hidden dimension (Triton only, default: 128)
+
+**Parameters for packed_split:**
+- `x`: Input tensor of shape (total_length, h)
+- `vid_lengths`: List of lengths for video segments
+- `txt_lengths`: List of lengths for text segments or None
+- `vid_padding`: Padding size for video output (default: 0)
+- `txt_padding`: Padding size for text output (default: 0)
+- `block_size_h`: Block size for hidden dimension (Triton only, default: 128)
+
 ## Development
 
 ### Code Formatting
@@ -112,11 +159,15 @@ pytest tests/test_gemm.py
 ```bash
 # Run the GEMM example
 python examples/gemm_example.py
+
+# Run the packed operations example
+python examples/packed_ops_example.py
 ```
 
-The example demonstrates:
+The examples demonstrate:
 - Basic usage of both PyTorch and Triton implementations
-- Matrix multiplication with different sizes
+- Matrix multiplication with different sizes (GEMM)
+- Packed merge and split operations for variable-length sequences
 - Testing different block size configurations (when CUDA is available)
 
 ### Running Benchmarks
@@ -124,13 +175,16 @@ The example demonstrates:
 ```bash
 # Run the GEMM benchmark (requires CUDA)
 python benchmark/bench_gemm.py
+
+# Run the packed operations benchmark (requires CUDA)
+python benchmark/bench_packed_ops.py
 ```
 
-The benchmark:
-- Compares performance of Triton vs PyTorch implementations
-- Tests different block size configurations
-- Generates performance plots showing TFLOPS across matrix sizes
-- Requires a CUDA-capable GPU
+The benchmarks:
+- Compare performance of Triton vs PyTorch implementations
+- Test different configurations and tensor sizes
+- Generate performance plots and speedup metrics
+- Require a CUDA-capable GPU
 
 See [benchmark/README.md](benchmark/README.md) for detailed information.
 
@@ -138,23 +192,22 @@ See [benchmark/README.md](benchmark/README.md) for detailed information.
 
 ```
 triton_kernels/
-├── triton_kernels/          # Main package
+├── src/triton_kernels/      # Main package
 │   ├── __init__.py
-│   └── kernels/             # Kernel implementations
-│       ├── __init__.py
-│       └── gemm.py          # GEMM kernel
+│   ├── gemm.py              # GEMM kernel
+│   └── packed_ops.py        # Packed merge/split operations
 ├── tests/                   # Unit tests
-│   ├── __init__.py
-│   └── test_gemm.py        # GEMM tests
+│   ├── test_gemm.py         # GEMM tests
+│   └── test_packed_ops.py   # Packed operations tests
 ├── examples/                # Example scripts
-│   └── gemm_example.py     # GEMM usage example
+│   ├── gemm_example.py      # GEMM usage example
+│   └── packed_ops_example.py # Packed operations example
 ├── benchmark/               # Performance benchmarks
-│   ├── __init__.py
-│   ├── bench_gemm.py       # GEMM benchmark
-│   └── README.md           # Benchmark documentation
-├── pyproject.toml          # Project configuration
-├── setup.py                # Setup script
-└── README.md               # This file
+│   ├── bench_gemm.py        # GEMM benchmark
+│   └── bench_packed_ops.py  # Packed operations benchmark
+├── pyproject.toml           # Project configuration
+├── setup.py                 # Setup script
+└── README.md                # This file
 ```
 
 ## Contributing
