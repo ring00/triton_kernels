@@ -27,4 +27,4 @@ jobs:
         run: pip install uv
 
       - name: Install project dependencies
-        run: uv pip install -e ".[dev]"
+        run: uv pip install --system -e ".[dev]"
