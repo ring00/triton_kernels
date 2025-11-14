@@ -148,7 +148,7 @@ def _packed_merge_kernel(
 
     Optimizations:
     - Vectorized memory loads with eviction policy hints
-    - Early exit on segment found
+    - Conditional segment scanning to avoid redundant checks once found
     - Optimized for H100's 3 TB/s HBM3 bandwidth
     """
     row_idx = tl.program_id(0)
@@ -161,30 +161,25 @@ def _packed_merge_kernel(
     final_src_idx = 0
     found = False
 
-    # Optimized segment scanning with early exit
+    # Optimized segment scanning
     for i in range(n_segments):
-        if found:
-            break
-
         vid_len = tl.load(vid_lengths_ptr + i)
-        if row_idx < out_seg_offset + vid_len:
+        if not found and row_idx < out_seg_offset + vid_len:
             in_seg_idx = row_idx - out_seg_offset
             final_src_idx = vid_seg_offset + in_seg_idx
             final_src_ptr = vid_ptr
             found = True
-            break
 
         out_seg_offset += vid_len
         vid_seg_offset += vid_len
 
         if HAS_TXT:
             txt_len = tl.load(txt_lengths_ptr + i)
-            if row_idx < out_seg_offset + txt_len:
+            if not found and row_idx < out_seg_offset + txt_len:
                 in_seg_idx = row_idx - out_seg_offset
                 final_src_idx = txt_seg_offset + in_seg_idx
                 final_src_ptr = txt_ptr
                 found = True
-                break
 
             out_seg_offset += txt_len
             txt_seg_offset += txt_len
@@ -221,7 +216,7 @@ def _packed_split_kernel(
 
     Optimizations:
     - Vectorized memory loads with eviction policy hints
-    - Early exit on segment found
+    - Conditional segment scanning to avoid redundant checks once found
     - Optimized for H100's 3 TB/s HBM3 bandwidth
     """
     row_idx = tl.program_id(0)
@@ -234,30 +229,25 @@ def _packed_split_kernel(
     final_dst_idx = 0
     found = False
 
-    # Optimized segment scanning with early exit
+    # Optimized segment scanning
     for i in range(n_segments):
-        if found:
-            break
-
         vid_len = tl.load(vid_lengths_ptr + i)
-        if row_idx < in_seg_offset + vid_len:
+        if not found and row_idx < in_seg_offset + vid_len:
             in_seg_idx = row_idx - in_seg_offset
             final_dst_idx = vid_seg_offset + in_seg_idx
             final_dst_ptr = vid_out_ptr
             found = True
-            break
 
         in_seg_offset += vid_len
         vid_seg_offset += vid_len
 
         if HAS_TXT:
             txt_len = tl.load(txt_lengths_ptr + i)
-            if row_idx < in_seg_offset + txt_len:
+            if not found and row_idx < in_seg_offset + txt_len:
                 in_seg_idx = row_idx - in_seg_offset
                 final_dst_idx = txt_seg_offset + in_seg_idx
                 final_dst_ptr = txt_out_ptr
                 found = True
-                break
 
             in_seg_offset += txt_len
             txt_seg_offset += txt_len

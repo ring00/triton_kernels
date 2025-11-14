@@ -4,10 +4,10 @@ This document describes the optimizations made to the Triton kernels in `src/tri
 
 ## Optimizations Implemented
 
-### 1. Early Exit in Segment Scanning
-- **Change**: Added explicit `break` statements when target segment is found
-- **Benefit**: Reduces unnecessary loop iterations and memory loads
-- **Impact**: Lower latency for segment lookup operations
+### 1. Conditional Segment Scanning
+- **Change**: Uses `if not found` checks to avoid redundant segment checks after target is found
+- **Benefit**: Reduces unnecessary condition evaluations and memory loads
+- **Impact**: Lower latency for segment lookup operations (note: Triton doesn't support `break` statements)
 
 ### 2. Cache Eviction Policy
 - **Change**: Added `eviction_policy="evict_last"` to `tl.load()` operations
