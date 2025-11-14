@@ -3,14 +3,12 @@ Packed tensor operations for merging and splitting tensor segments.
 
 This module provides:
 1. Reference PyTorch implementations for correctness validation
-2. Triton kernel implementations (currently using PyTorch fallback)
-
-Note: The Triton implementations use PyTorch fallback because packed
-operations with variable-length segments are difficult to parallelize
-efficiently in Triton.
+2. Optimized Triton kernel implementations
 """
 
 import torch
+import triton
+import triton.language as tl
 
 
 def packed_merge_torch(
@@ -55,6 +53,58 @@ def packed_merge_torch(
                 vid_offset += vid_length
 
     return torch.cat(segments, dim=0)
+
+
+@triton.jit
+def _packed_merge_kernel(
+    vid_ptr,
+    txt_ptr,
+    out_ptr,
+    vid_lengths_ptr,
+    txt_lengths_ptr,
+    num_segments,
+    has_txt,
+    stride_h,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Triton kernel for packed merge."""
+    pid = tl.program_id(0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+
+    # Calculate output position and source for each element
+    out_offset = 0
+    vid_offset = 0
+    txt_offset = 0
+
+    for seg_idx in range(num_segments):
+        vid_len = tl.load(vid_lengths_ptr + seg_idx)
+
+        if vid_len > 0:
+            mask = (offsets >= out_offset) & (offsets < out_offset + vid_len)
+            for h in range(stride_h):
+                vid_vals = tl.load(
+                    vid_ptr + (vid_offset + offsets - out_offset) * stride_h + h,
+                    mask=mask,
+                    other=0.0,
+                )
+                tl.store(out_ptr + offsets * stride_h + h, vid_vals, mask=mask)
+            out_offset += vid_len
+            vid_offset += vid_len
+
+        if has_txt:
+            txt_len = tl.load(txt_lengths_ptr + seg_idx)
+            if txt_len > 0:
+                mask = (offsets >= out_offset) & (offsets < out_offset + txt_len)
+                for h in range(stride_h):
+                    txt_vals = tl.load(
+                        txt_ptr + (txt_offset + offsets - out_offset) * stride_h + h,
+                        mask=mask,
+                        other=0.0,
+                    )
+                    tl.store(out_ptr + offsets * stride_h + h, txt_vals, mask=mask)
+                out_offset += txt_len
+                txt_offset += txt_len
 
 
 def packed_merge_triton(
