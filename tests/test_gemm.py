@@ -202,8 +202,8 @@ class TestGEMMComparison:
     def test_torch_vs_triton(self):
         """Test that Triton and PyTorch implementations produce similar results."""
         M, K, N = 256, 128, 256
-        a = torch.randn(M, K, dtype=torch.float32)
-        b = torch.randn(K, N, dtype=torch.float32)
+        a = torch.randn(M, K, device="cuda", dtype=torch.float16)
+        b = torch.randn(K, N, device="cuda", dtype=torch.float16)
 
         # PyTorch result
         c_torch = gemm_torch(a, b)
@@ -213,6 +213,4 @@ class TestGEMMComparison:
         b_gpu = b.to(device="cuda", dtype=torch.float16)
         c_triton = gemm_triton(a_gpu, b_gpu)
 
-        # Compare (allowing for float16 precision differences)
-        c_torch_gpu = c_torch.to(device="cuda", dtype=torch.float16)
-        assert torch.allclose(c_triton, c_torch_gpu, rtol=1e-2, atol=1e-2)
+        assert torch.allclose(c_triton, c_torch)

@@ -96,6 +96,7 @@ class TestPackedSplitTorch:
 
         vid, txt = packed_split_torch(x, vid_lengths, txt_lengths)
 
+        assert txt is not None
         assert vid.shape == (10, 64)
         assert txt.shape == (6, 64)
         torch.testing.assert_close(vid[0:4], x[0:4])
@@ -126,6 +127,7 @@ class TestPackedSplitTorch:
             x, vid_lengths, txt_lengths, vid_padding=2, txt_padding=3
         )
 
+        assert txt is not None
         assert vid.shape == (12, 64)
         assert txt.shape == (3, 64)
         torch.testing.assert_close(vid[0:10], x)
@@ -140,6 +142,7 @@ class TestPackedSplitTorch:
 
         vid, txt = packed_split_torch(x, vid_lengths, txt_lengths)
 
+        assert txt is not None
         assert vid.shape == (7, 64)
         assert txt.shape == (4, 64)
 
@@ -151,6 +154,7 @@ class TestPackedSplitTorch:
 
         vid, txt = packed_split_torch(x, vid_lengths, txt_lengths)
 
+        assert txt is not None
         assert vid.shape == (5, 32)
         assert txt.shape == (3, 32)
         torch.testing.assert_close(vid, x[0:5])
@@ -200,12 +204,8 @@ class TestPackedMergeTriton:
 
         assert result.shape == (16, 64)
         # Compare with PyTorch reference
-        vid_cpu = vid.cpu().to(torch.float32)
-        txt_cpu = txt.cpu().to(torch.float32)
-        expected = packed_merge_torch(vid_cpu, txt_cpu, vid_lengths, txt_lengths)
-        torch.testing.assert_close(
-            result.cpu().to(torch.float32), expected, rtol=1e-2, atol=1e-2
-        )
+        expected = packed_merge_torch(vid, txt, vid_lengths, txt_lengths)
+        torch.testing.assert_close(result, expected)
 
     def test_merge_without_text(self):
         """Test merge operation with only video."""
@@ -215,11 +215,8 @@ class TestPackedMergeTriton:
         result = packed_merge_triton(vid, None, vid_lengths, None)
 
         assert result.shape == (10, 64)
-        vid_cpu = vid.cpu().to(torch.float32)
-        expected = packed_merge_torch(vid_cpu, None, vid_lengths, None)
-        torch.testing.assert_close(
-            result.cpu().to(torch.float32), expected, rtol=1e-2, atol=1e-2
-        )
+        expected = packed_merge_torch(vid, None, vid_lengths, None)
+        torch.testing.assert_close(result, expected)
 
     def test_merge_with_zero_lengths(self):
         """Test merge with some zero-length segments."""
@@ -231,12 +228,8 @@ class TestPackedMergeTriton:
         result = packed_merge_triton(vid, txt, vid_lengths, txt_lengths)
 
         assert result.shape == (11, 64)
-        vid_cpu = vid.cpu().to(torch.float32)
-        txt_cpu = txt.cpu().to(torch.float32)
-        expected = packed_merge_torch(vid_cpu, txt_cpu, vid_lengths, txt_lengths)
-        torch.testing.assert_close(
-            result.cpu().to(torch.float32), expected, rtol=1e-2, atol=1e-2
-        )
+        expected = packed_merge_torch(vid, txt, vid_lengths, txt_lengths)
+        torch.testing.assert_close(result, expected)
 
     def test_merge_different_hidden_sizes(self):
         """Test merge with different hidden dimensions."""
@@ -249,12 +242,8 @@ class TestPackedMergeTriton:
             result = packed_merge_triton(vid, txt, vid_lengths, txt_lengths)
 
             assert result.shape == (12, h)
-            vid_cpu = vid.cpu().to(torch.float32)
-            txt_cpu = txt.cpu().to(torch.float32)
-            expected = packed_merge_torch(vid_cpu, txt_cpu, vid_lengths, txt_lengths)
-            torch.testing.assert_close(
-                result.cpu().to(torch.float32), expected, rtol=1e-2, atol=1e-2
-            )
+            expected = packed_merge_torch(vid, txt, vid_lengths, txt_lengths)
+            torch.testing.assert_close(result, expected)
 
     def test_merge_large_tensors(self):
         """Test merge with large tensors."""
@@ -280,17 +269,13 @@ class TestPackedSplitTriton:
 
         vid, txt = packed_split_triton(x, vid_lengths, txt_lengths)
 
+        assert txt is not None
         assert vid.shape == (10, 64)
         assert txt.shape == (6, 64)
         # Compare with PyTorch reference
-        x_cpu = x.cpu().to(torch.float32)
-        vid_expected, txt_expected = packed_split_torch(x_cpu, vid_lengths, txt_lengths)
-        torch.testing.assert_close(
-            vid.cpu().to(torch.float32), vid_expected, rtol=1e-2, atol=1e-2
-        )
-        torch.testing.assert_close(
-            txt.cpu().to(torch.float32), txt_expected, rtol=1e-2, atol=1e-2
-        )
+        vid_expected, txt_expected = packed_split_torch(x, vid_lengths, txt_lengths)
+        torch.testing.assert_close(vid, vid_expected)
+        torch.testing.assert_close(txt, txt_expected)
 
     def test_split_without_text(self):
         """Test split operation with only video."""
@@ -301,11 +286,8 @@ class TestPackedSplitTriton:
 
         assert vid.shape == (10, 64)
         assert txt is None
-        x_cpu = x.cpu().to(torch.float32)
-        vid_expected, _ = packed_split_torch(x_cpu, vid_lengths, None)
-        torch.testing.assert_close(
-            vid.cpu().to(torch.float32), vid_expected, rtol=1e-2, atol=1e-2
-        )
+        vid_expected, _ = packed_split_torch(x, vid_lengths, None)
+        torch.testing.assert_close(vid, vid_expected)
 
     def test_split_with_padding(self):
         """Test split with padding."""
@@ -317,13 +299,16 @@ class TestPackedSplitTriton:
             x, vid_lengths, txt_lengths, vid_padding=2, txt_padding=3
         )
 
+        assert txt is not None
         assert vid.shape == (12, 64)
         assert txt.shape == (3, 64)
         # Check that padding is zeros
         torch.testing.assert_close(
-            vid[10:12].cpu(), torch.zeros(2, 64), rtol=1e-2, atol=1e-2
+            vid[10:12], torch.zeros(2, 64, dtype=torch.float16, device="cuda")
         )
-        torch.testing.assert_close(txt.cpu(), torch.zeros(3, 64), rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(
+            txt, torch.zeros(3, 64, dtype=torch.float16, device="cuda")
+        )
 
     def test_split_with_zero_lengths(self):
         """Test split with some zero-length segments."""
@@ -333,6 +318,7 @@ class TestPackedSplitTriton:
 
         vid, txt = packed_split_triton(x, vid_lengths, txt_lengths)
 
+        assert txt is not None
         assert vid.shape == (7, 64)
         assert txt.shape == (4, 64)
 
@@ -345,6 +331,7 @@ class TestPackedSplitTriton:
 
             vid, txt = packed_split_triton(x, vid_lengths, txt_lengths)
 
+            assert txt is not None
             assert vid.shape == (8, h)
             assert txt.shape == (4, h)
 
@@ -363,8 +350,8 @@ class TestPackedMergeSplitTritonRoundTrip:
         merged = packed_merge_triton(vid_orig, txt_orig, vid_lengths, txt_lengths)
         vid, txt = packed_split_triton(merged, vid_lengths, txt_lengths)
 
-        torch.testing.assert_close(vid, vid_orig, rtol=1e-2, atol=1e-2)
-        torch.testing.assert_close(txt, txt_orig, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(vid, vid_orig)
+        torch.testing.assert_close(txt, txt_orig)
 
     def test_roundtrip_without_text(self):
         """Test that merge followed by split recovers original tensor."""
@@ -374,7 +361,7 @@ class TestPackedMergeSplitTritonRoundTrip:
         merged = packed_merge_triton(vid_orig, None, vid_lengths, None)
         vid, txt = packed_split_triton(merged, vid_lengths, None)
 
-        torch.testing.assert_close(vid, vid_orig, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(vid, vid_orig)
         assert txt is None
 
 
@@ -384,8 +371,8 @@ class TestPackedOpsComparison:
 
     def test_merge_torch_vs_triton(self):
         """Test that Triton and PyTorch merge implementations produce similar results."""
-        vid = torch.randn(20, 128, dtype=torch.float32)
-        txt = torch.randn(12, 128, dtype=torch.float32)
+        vid = torch.randn(20, 128, dtype=torch.float16, device="cuda")
+        txt = torch.randn(12, 128, dtype=torch.float16, device="cuda")
         vid_lengths = [5, 7, 8]
         txt_lengths = [4, 4, 4]
 
@@ -393,19 +380,13 @@ class TestPackedOpsComparison:
         result_torch = packed_merge_torch(vid, txt, vid_lengths, txt_lengths)
 
         # Triton result
-        vid_gpu = vid.to(device="cuda", dtype=torch.float16)
-        txt_gpu = txt.to(device="cuda", dtype=torch.float16)
-        result_triton = packed_merge_triton(vid_gpu, txt_gpu, vid_lengths, txt_lengths)
+        result_triton = packed_merge_triton(vid, txt, vid_lengths, txt_lengths)
 
-        # Compare (allowing for float16 precision differences)
-        result_torch_gpu = result_torch.to(device="cuda", dtype=torch.float16)
-        torch.testing.assert_close(
-            result_triton, result_torch_gpu, rtol=1e-2, atol=1e-2
-        )
+        torch.testing.assert_close(result_triton, result_torch)
 
     def test_split_torch_vs_triton(self):
         """Test that Triton and PyTorch split implementations produce similar results."""
-        x = torch.randn(32, 128, dtype=torch.float32)
+        x = torch.randn(32, 128, dtype=torch.float16, device="cuda")
         vid_lengths = [5, 7, 8]
         txt_lengths = [4, 4, 4]
 
@@ -413,11 +394,8 @@ class TestPackedOpsComparison:
         vid_torch, txt_torch = packed_split_torch(x, vid_lengths, txt_lengths)
 
         # Triton result
-        x_gpu = x.to(device="cuda", dtype=torch.float16)
-        vid_triton, txt_triton = packed_split_triton(x_gpu, vid_lengths, txt_lengths)
+        vid_triton, txt_triton = packed_split_triton(x, vid_lengths, txt_lengths)
 
         # Compare (allowing for float16 precision differences)
-        vid_torch_gpu = vid_torch.to(device="cuda", dtype=torch.float16)
-        txt_torch_gpu = txt_torch.to(device="cuda", dtype=torch.float16)
-        torch.testing.assert_close(vid_triton, vid_torch_gpu, rtol=1e-2, atol=1e-2)
-        torch.testing.assert_close(txt_triton, txt_torch_gpu, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(vid_triton, vid_torch)
+        torch.testing.assert_close(txt_triton, txt_torch)
